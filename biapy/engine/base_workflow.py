@@ -106,8 +106,8 @@ class Base_Workflow(metaclass=ABCMeta):
         self.global_rank = get_rank()
         if self.cfg.TEST.BY_CHUNKS.ENABLE and self.cfg.PROBLEM.NDIM == '3D':
             maxsize = min(10,self.cfg.SYSTEM.NUM_GPUS*10)
-            self.output_queue = mp.Queue(maxsize=maxsize)
-            self.input_queue = mp.Queue(maxsize=maxsize)
+            self.output_queue = mp.Queue(maxsize=0)
+            self.input_queue = mp.Queue(maxsize=0)
             self.extract_info_queue = mp.Queue()
 
         # Test variables
@@ -954,11 +954,53 @@ class Base_Workflow(metaclass=ABCMeta):
         output_handle_proc.daemon=True
         output_handle_proc.start()
         
-        # Process in charge of loading part of the data 
-        load_data_process = mp.Process(target=extract_patch_from_dataset, args=(in_data, self.cfg, self.input_queue, 
-            self.extract_info_queue, self.cfg.TEST.VERBOSE))
-        load_data_process.daemon=True
-        load_data_process.start()
+        # # Process in charge of loading part of the data 
+        # load_data_process = mp.Process(target=extract_patch_from_dataset, args=(in_data, self.cfg, self.input_queue, 
+        #     self.extract_info_queue, self.cfg.TEST.VERBOSE))
+        # load_data_process.daemon=True
+        # load_data_process.start()
+
+        import zarrdataset as zds
+        from torch.utils.data import DataLoader
+
+        filename = r"H:\221024-PB_P_21_Emx1Cre_1921_6color\data\221024-PB_P_21_Emx1Cre_1921_6color res level 0.ome.zarr"
+
+        patch_size = dict(Z=17, Y=128, X=128)
+        overlap = dict(Z=4, Y=30, X=30)
+
+        patch_sampler = zds.OverlapGridPatchSampler(patch_size=patch_size, overlap=overlap)
+        # patch_sampler = zds.PatchSampler(patch_size=patch_size)
+        axes_sample = "ZYXC"
+        my_datasets = zds.ZarrDataset(
+            [
+            zds.ImagesDatasetSpecs(
+                filenames=filename,
+                source_axes="TCZYX",
+                axes=axes_sample,
+                data_group="0",
+            )
+            ],
+            patch_sampler=patch_sampler,
+            return_positions=True,
+            return_worker_id=True
+        )
+
+        import torchvision
+
+        img_preprocessing = torchvision.transforms.Compose([
+            zds.ToDtype(dtype=np.float32),
+            # torchvision.transforms.Lambda(lambda x: self.norm_X(np.array(x))),
+        ])
+
+        my_datasets.add_transform("images", img_preprocessing)
+
+        my_dataloader = DataLoader(my_datasets,
+                    num_workers=30,
+                        worker_init_fn=zds.zarrdataset_worker_init_fn,
+                    batch_size=1
+                    )
+
+
 
         if '_X_file' in locals() and isinstance(self._X_file, h5py.File):
             self._X_file.close()
@@ -967,11 +1009,34 @@ class Base_Workflow(metaclass=ABCMeta):
         # Lock the thread inferring until no more patches 
         if self.cfg.TEST.VERBOSE and self.cfg.SYSTEM.NUM_GPUS > 1:
             print(f"[Rank {get_rank()} ({os.getpid()})] Doing inference ")
-        while True:
-            obj = self.input_queue.get(timeout=60)
-            if obj == None: break
+        # while True:
+        for i, (wid, patch_coords, img) in tqdm(enumerate(my_dataloader)):
+            # print(wid)
+            # obj = self.input_queue.get(timeout=60)
+            # if obj == None: break
+            
+            # img, patch_coords = obj
 
-            img, patch_coords = obj
+            img = np.array(img)
+            patch_coords = np.array(patch_coords)[0][:-1]
+
+            for axis, i in enumerate(range(len(patch_coords))):
+                if patch_coords[i][0] != 0: # do not pad the first patch
+                    patch_coords[i][0] = int(patch_coords[i][0]) + int(overlap[axes_sample[axis]] // 2)
+                    patch_coords[i][1] = int(patch_coords[i][1]) - int(overlap[axes_sample[axis]] // 2)
+                else:
+                    patch_coords[i][1] = int(patch_coords[i][1]) - 2 * int(overlap[axes_sample[axis]] // 2)
+                
+                if patch_coords[i][0] < 0:
+                    patch_coords[i][0] = 0
+                # if patch_coords[i][1] > my_datasets._arr_lists[0].collection["images"].shape[i]:
+                if patch_coords[i][1] > data_shape[i+2]:
+                    
+                    patch_coords[i][0] = data_shape[i+2] - (patch_size[axes_sample[axis]] - overlap[axes_sample[axis]])
+                    patch_coords[i][1] = data_shape[i+2]
+                    # patch_coords[i][1] = my_datasets._arr_lists[0].collection["images"].shape[i]
+
+            # print(img.shape, patch_coords)
             img, _ = self.test_generator.norm_X(img)
             if self.cfg.TEST.AUGMENTATION:
                 p = ensemble16_3d_predictions(img[0], batch_size_value=self.cfg.TRAIN.BATCH_SIZE,
@@ -993,15 +1058,17 @@ class Base_Workflow(metaclass=ABCMeta):
                 self.cfg.DATA.TEST.PADDING[2]:p.shape[3]-self.cfg.DATA.TEST.PADDING[2]]
             m = np.ones(p.shape, dtype=np.uint8)
 
+            # print(p.shape)
+
             # Put the prediction into queue
             self.output_queue.put([p, m, patch_coords])         
 
-        # Get some auxiliar variables
-        self.stats['patch_counter'] = self.extract_info_queue.get(timeout=60)
-        if is_main_process():
-            z_vol_info = self.extract_info_queue.get(timeout=60)
-            list_of_vols_in_z  = self.extract_info_queue.get(timeout=60)
-        load_data_process.join()
+        # # Get some auxiliar variables
+        # self.stats['patch_counter'] = self.extract_info_queue.get(timeout=60)
+        # if is_main_process():
+        #     z_vol_info = self.extract_info_queue.get(timeout=60)
+        #     list_of_vols_in_z  = self.extract_info_queue.get(timeout=60)
+        # # load_data_process.join()
         output_handle_proc.join()
 
         # Wait until all threads are done so the main thread can create the full size image 
@@ -1643,8 +1710,12 @@ def extract_patch_from_dataset(data, cfg, input_queue, extract_info_queue, verbo
         overlap=cfg.DATA.TEST.OVERLAP, padding=cfg.DATA.TEST.PADDING, total_ranks=max(1,cfg.SYSTEM.NUM_GPUS), 
         rank=get_rank(), verbose=verbose):
 
+
         if is_main_process():
             img, patch_coords, total_vol, z_vol_info, list_of_vols_in_z = obj
+            print(">>>>>", list_of_vols_in_z)
+            print("#####",  total_vol)
+            print("#####",  z_vol_info)
         else: 
             img, patch_coords, total_vol = obj
 
@@ -1723,18 +1794,22 @@ def insert_patch_into_dataset(data_filename, data_filename_mask, data_shape, out
     filename, file_extension = os.path.splitext(os.path.basename(data_filename))
     
     # Obtain the total patches so we can display it for the user
-    total_patches = extract_info_queue.get(timeout=60)
-    for i in tqdm(range(total_patches), disable=not is_main_process()):
+    # total_patches = extract_info_queue.get(timeout=60)
+    total_patches = 9000000000
+    # for i in tqdm(range(total_patches), disable=not is_main_process()):
+    for i in range(total_patches):
         p, m, patch_coords = output_queue.get(timeout=60)
 
         if 'data' not in locals():
             # Channel dimension should be equal to the number of channel of the prediction
-            out_data_shape = tuple(data_shape)
+            out_data_shape = np.array(data_shape)
             if "C" not in cfg.TEST.BY_CHUNKS.INPUT_IMG_AXES_ORDER:
                 out_data_shape = tuple(out_data_shape) + (p.shape[-1],)
                 out_data_order = cfg.TEST.BY_CHUNKS.INPUT_IMG_AXES_ORDER + "C"
             else:
-                out_data_shape = tuple(out_data_shape[:-1]) + (p.shape[-1],)
+                # out_data_shape = tuple(out_data_shape[:-1]) + (p.shape[-1],)
+                out_data_shape[cfg.TEST.BY_CHUNKS.INPUT_IMG_AXES_ORDER.index("C")] = 1
+                out_data_shape = tuple(out_data_shape)
                 out_data_order = cfg.TEST.BY_CHUNKS.INPUT_IMG_AXES_ORDER
 
             if file_type == "h5":
@@ -1756,6 +1831,12 @@ def insert_patch_into_dataset(data_filename, data_filename_mask, data_shape, out
         transpose_order = order_dimensions(current_order, input_order="ZYXC", output_order=out_data_order,
             default_value=np.nan)
         transpose_order = [x for x in transpose_order if not np.isnan(x)]
+
+        # print(">>>>>", p.shape)
+        # print(">>>>>", transpose_order)
+        # print(">>>>>", data_ordered_slices)
+        # print(data.shape)
+        # print("out_shape", data_shape, out_data_shape)
 
         data[data_ordered_slices] += p.transpose(transpose_order)
         mask[data_ordered_slices] += m.transpose(transpose_order)
