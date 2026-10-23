@@ -14,6 +14,168 @@ from torch.nn.modules.loss import _Loss
 from typing import Dict, Optional, List
 
 
+_BIG = 1.0e4
+def _min_pool_k(x: torch.Tensor, k) -> torch.Tensor:
+    return -F.max_pool3d(-x, kernel_size=k, stride=1, padding=tuple(s // 2 for s in k))
+VOXEL_UM = (1.2, 0.4, 0.4)
+def _dilate3d_um(x: torch.Tensor, r_um: float) -> torch.Tensor:
+    r = [int(round(r_um / v)) for v in VOXEL_UM]
+    if max(r) == 0:
+        return x
+    return F.max_pool3d(x, kernel_size=[2 * k + 1 for k in r], stride=1, padding=r)
+
+@torch.no_grad()
+def geodesic_from_border(mask: torch.Tensor, n_iter: int | None = None) -> torch.Tensor:
+    """
+    Distance géodésique de Chebyshev, confinée à `mask`, depuis les voxels de
+    `mask` qui touchent le bord du patch (= les "extrémités" de l'axone, qui
+    traverse presque toujours le crop).
+    mask : (B,1,D,H,W) float dans {0,1}
+    -> (B,1,D,H,W) float, _BIG hors du masque ou inatteignable.
+    """
+    B, _, D, H, W = mask.shape
+    if n_iter is None:
+        n_iter = int(1.5 * max(D, H, W))
+    border = torch.zeros_like(mask)
+    border[:, :, 0, :, :] = 1.0
+    border[:, :, -1, :, :] = 1.0
+    border[:, :, :, 0, :] = 1.0
+    border[:, :, :, -1, :] = 1.0
+    border[:, :, :, :, 0] = 1.0
+    border[:, :, :, :, -1] = 1.0
+    seed = mask * border
+    big = torch.full_like(mask, _BIG)
+    U = torch.where(seed > 0.5, torch.zeros_like(mask), big)
+    U = torch.where(mask > 0.5, U, big)
+    for it in range(n_iter):
+        #U_new = torch.minimum(U, _min_pool3d(U) + 1.0)
+        step_plan = _min_pool_k(U, (1, 3, 3)) + VOXEL_UM[1]
+        step_z = _min_pool_k(U, (3, 3, 3)) + VOXEL_UM[0]
+        U_new = torch.minimum(U, torch.minimum(step_plan, step_z))
+        U_new = torch.where(mask > 0.5, U_new, big).clamp(max=_BIG)
+        if it % 16 == 15:
+            if bool(torch.all(U_new == U)):
+                U = U_new
+                break
+        U = U_new
+    return U
+@torch.no_grad()
+def criticality_weights(
+    mask: torch.Tensor,
+    ramp: float = 12.0,
+    w_floor: float = 0.15,
+    n_iter: int | None = None,
+) -> torch.Tensor:
+    """
+    Carte de poids w(x) in [w_floor, 1] sur le masque GT.
+    w ~ 0 aux extrémités, monte linéairement sur `ramp` voxels d'abscisse
+    curviligne, puis plateau à 1.
+    Retourne (B,1,D,H,W), nul hors du masque.
+    """
+    U = geodesic_from_border(mask, n_iter=n_iter)
+    reachable = ((U < 0.5 * _BIG).float()) * mask
+    m = U * reachable
+    m_max = m.flatten(1).max(dim=1).values.view(-1, 1, 1, 1, 1)
+    has_seed = (reachable.flatten(1).sum(dim=1) > 0).view(-1, 1, 1, 1, 1)
+    r = torch.minimum(torch.full_like(m_max, float(ramp)), 0.5 * m_max.clamp(min=1.0))
+    w = (m / r.clamp(min=1.0)).clamp(max=1.0)
+    ones = torch.ones_like(w)
+    w = torch.where(reachable > 0.5, w, ones)
+    w = torch.where(has_seed, w, ones)
+    w = w_floor + (1.0 - w_floor) * w
+    return w * mask
+class BWclDiceLoss(nn.Module):
+    """
+    L = w_dice * (1 - Dice) + w_topo * (1 - T)
+        T = TP_w / (TP_w + alpha*FP_phi + beta*FN_w)
+    TP_w, FN_w : pondérés par la criticité (faible aux extrémités de l'axone)
+    FP_phi     : pondérés par la distance au GT (0 dans la bande tolérée)
+    alpha : pénalité des fuites. Monter si le modèle grossit / déborde sur
+            les axones voisins. Descendre s'il devient trop maigre.
+    beta  : pénalité des manqués. Monter si le squelette se rompt.
+    """
+    def __init__(
+        self,
+        w_dice: float = 1.0,
+        w_topo: float = 1.0,
+        alpha: float = 0.5,
+        beta: float = 0.5,
+        ramp: float = 12.0,
+        w_floor: float = 0.15,
+        tol_in: float = 2.0,
+        tol_out: float = 6.0,
+        from_logits: bool = True,
+        fg_channel: int = 1,
+        smooth: float = 1.0,
+        warmup_iters: int = 0,
+        geo_iters: int | None = None,
+    ):
+        super().__init__()
+        self.w_dice, self.w_topo = w_dice, w_topo
+        self.alpha, self.beta = alpha, beta
+        self.ramp, self.w_floor = ramp, w_floor
+        self.tol_in, self.tol_out = tol_in, tol_out
+        self.from_logits, self.fg_channel = from_logits, fg_channel
+        self.smooth = smooth
+        self.warmup_iters, self.geo_iters = warmup_iters, geo_iters
+        self.register_buffer("_step", torch.zeros((), dtype=torch.long))
+        self.last_stats = {}
+
+    def _fg_prob(self, y_pred: torch.Tensor) -> torch.Tensor:
+        if y_pred.shape[1] == 1:
+            return torch.sigmoid(y_pred) if self.from_logits else y_pred
+        p = torch.softmax(y_pred, dim=1) if self.from_logits else y_pred
+        return p[:, self.fg_channel : self.fg_channel + 1]
+    def _fg_target(self, y_true: torch.Tensor) -> torch.Tensor:
+        y = y_true
+        if y.dim() == 4:  # (B,D,H,W) -> (B,1,D,H,W)
+            y = y.unsqueeze(1)
+        if y.shape[1] == 1:
+            y = (y > 0.5).float() if y.dtype.is_floating_point else (y > 0).float()
+        else:  # one-hot
+            y = (y[:, self.fg_channel : self.fg_channel + 1] > 0.5).float()
+        return y
+    def _ramp(self) -> float:
+        if self.warmup_iters <= 0:
+            return 1.0
+        return float(min(1.0, self._step.item() / self.warmup_iters))
+    def forward(self, y_pred, y_true):
+        p = self._fg_prob(y_pred)
+        y = self._fg_target(y_true).to(p.dtype)
+        dims = (1, 2, 3, 4)
+        p_sum, y_sum = p.sum(dims), y.sum(dims)
+        has_gt = (y_sum > 0).to(p.dtype)
+        n_gt = has_gt.sum().clamp(min=1.0)
+
+        inter = (p * y).sum(dims)
+        dice = (2.0 * inter + self.smooth) / (p_sum + y_sum + self.smooth)
+        loss_dice = 1.0 - dice.mean()
+
+        with torch.no_grad():
+            w = criticality_weights(
+                y, ramp=self.ramp, w_floor=self.w_floor, n_iter=self.geo_iters
+            ).to(p.dtype)
+            phi = 1.0 - 0.5 * (_dilate3d_um(y, self.tol_in) + _dilate3d_um(y, self.tol_out))
+
+        tp = (w * p).sum(dims)
+        fn = (w * (1.0 - p)).sum(dims)
+        fp = (p * phi).sum(dims)
+        T = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+        loss_topo = ((1.0 - T) * has_gt).sum() / n_gt
+        a = self._ramp()
+        if self.training:
+            self._step += 1
+            with torch.no_grad():
+                self.last_stats = {
+                    "vol_ratio": (p_sum / y_sum.clamp(min=1.0)).mean().item(),
+                    "precision": (inter / p_sum.clamp(min=1.0)).mean().item(),
+                    "recall": (inter / y_sum.clamp(min=1.0)).mean().item(),
+                    "leak_frac": (fp / p_sum.clamp(min=1.0)).mean().item(),
+                }
+        return self.w_dice * loss_dice + a * self.w_topo * loss_topo
+
 def jaccard_index_numpy(y_true, y_pred):
     """
     Define Jaccard index.

@@ -1,0 +1,97 @@
+# BiaPy version: 3.5.13
+
+SYSTEM:
+    NUM_CPUS: -1
+    SEED:  0
+
+PROBLEM:
+    TYPE: SEMANTIC_SEG
+    NDIM: 3D
+
+DATA:
+    PATCH_SIZE: (32, 128, 128, 3)
+    # COLOUR_GATE:
+    #     ENABLE: True
+    #     SIGMA: 0.20
+    NORMALIZATION :
+        TYPE : "scale_range"
+    #EXTRACT_RANDOM_PATCH : True
+    #PROBABILITY_MAP : True
+    # W_FOREGROUND : 0.94
+    # W_BACKGROUND : 0.06
+    TRAIN:
+        PATH: /home/yasminebenjelloun/dataset/dataset_tubes/train/raw
+        GT_PATH: /home/yasminebenjelloun/dataset/dataset_tubes/train/label
+    #   PATH: /home/yasminebenjelloun/dataset/segmentation_data_moyen_10000/train/raw
+    #   GT_PATH: /home/yasminebenjelloun/dataset/segmentation_data_moyen_10000/train/label
+        IN_MEMORY: True
+    # VAL:
+    #     SPLIT_TRAIN: 0.1
+    VAL:
+        FROM_TRAIN: False
+        PATH: /home/yasminebenjelloun/dataset/dataset_tubes/val/raw
+        GT_PATH: /home/yasminebenjelloun/dataset/dataset_tubes/val/label
+        IN_MEMORY: True
+
+    TEST:
+        PATH: /home/yasminebenjelloun/dataset/dataset_tubes/test/raw
+        GT_PATH: /home/yasminebenjelloun/dataset/dataset_tubes/test/label
+        IN_MEMORY: True
+        LOAD_GT: True
+        PADDING: (10,10,10)
+
+AUGMENTOR:
+    ENABLE: True
+    RANDOM_ROT: True
+    VFLIP: True
+    HFLIP: True
+    ZFLIP: True
+    CONTRAST: True
+    CONTRAST_FACTOR: (-0.3, 0.3)
+    BRIGHTNESS: True
+    BRIGHTNESS_FACTOR: (-0.3, 0.3)
+    GAMMA_CONTRAST: True
+    GC_GAMMA: (0.5, 1.5)
+    CHANNEL_SHUFFLE: True
+
+MODEL:
+    ARCHITECTURE: resunet
+    FEATURE_MAPS: [16, 32, 64, 128, 256] #[32, 64, 128, 256, 512]
+    LOAD_CHECKPOINT: False
+
+TRAIN:
+    ENABLE: True
+    METRICS : ["iou", "cldice"]
+    OPTIMIZER: ADAMW
+    #ACCUM_ITER : 2
+    LR: 5.E-4
+    BATCH_SIZE: 4
+    EPOCHS: 300 #500
+    PATIENCE: 30
+    LR_SCHEDULER:
+        #NAME: reduceonplateau
+        NAME: 'onecycle'
+
+    # LR_SCHEDULER:
+    #     #NAME: 'onecycle'
+    #     NAME: 'warmupcosine'
+    #     MIN_LR: 1.E-6
+    #     WARMUP_COSINE_DECAY_EPOCHS: 50    # use one-cycle learning rate scheduler
+
+TEST:
+    ENABLE: True
+    AUGMENTATION: False
+    FULL_IMG: False
+    METRICS : ["iou", "cldice"]
+
+LOSS:
+    TYPE: BWCLDICE
+    BWCLDICE_W_DICE: 1.0
+    BWCLDICE_W_TOPO: 1.0
+    BWCLDICE_ALPHA: 0.5
+    BWCLDICE_BETA: 0.5
+    BWCLDICE_RAMP: 4.8
+    BWCLDICE_W_FLOOR: 1.0
+    BWCLDICE_TOL_IN: 0.0
+    BWCLDICE_TOL_OUT: 0.0
+    BWCLDICE_WARMUP: 0

@@ -1146,6 +1146,16 @@ class Config:
         # Value to ignore when 'LOSS.IGNORE_VALUES' is True
         _C.LOSS.VALUE_TO_IGNORE = -1
 
+        _C.LOSS.BWCLDICE_W_DICE = 1.0
+        _C.LOSS.BWCLDICE_W_TOPO = 1.0
+        _C.LOSS.BWCLDICE_ALPHA = 0.5 # pénalité des fuites
+        _C.LOSS.BWCLDICE_BETA = 0.5 # pénalité des manqués
+        _C.LOSS.BWCLDICE_RAMP = 12.0
+        _C.LOSS.BWCLDICE_W_FLOOR = 0.15
+        _C.LOSS.BWCLDICE_TOL_IN = 2.0
+        _C.LOSS.BWCLDICE_TOL_OUT = 6.0
+        _C.LOSS.BWCLDICE_WARMUP = 2000
+
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Training phase
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

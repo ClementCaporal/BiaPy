@@ -10,6 +10,7 @@ from biapy.engine.base_workflow import Base_Workflow
 from biapy.data.data_manipulation import check_masks, save_tif
 from biapy.utils.misc import to_pytorch_format, to_numpy_format, to_pytorch_format, MetricLogger
 from biapy.engine.metrics import (
+    BWclDiceLoss,
     jaccard_index,
     CrossEntropyLoss_wrapper,
     DiceBCELoss,
@@ -17,6 +18,7 @@ from biapy.engine.metrics import (
     SoftclDiceLoss,
     )
 from biapy.data.dataset import PatchCoords
+
 
 
 class Semantic_Segmentation_Workflow(Base_Workflow):
@@ -149,6 +151,20 @@ class Semantic_Segmentation_Workflow(Base_Workflow):
             smooth = getattr(self.cfg.LOSS, "SMOOTH", 1.0)
             nclass = self.cfg.MODEL.N_CLASSES
             self.loss = SoftclDiceLoss(iter_=iter_, smooth=smooth, num_classes=nclass) 
+        elif self.cfg.LOSS.TYPE == "BWCLDICE":
+            self.loss = BWclDiceLoss(
+                w_dice=self.cfg.LOSS.BWCLDICE_W_DICE,
+                w_topo=self.cfg.LOSS.BWCLDICE_W_TOPO,
+                alpha=self.cfg.LOSS.BWCLDICE_ALPHA,
+                beta=self.cfg.LOSS.BWCLDICE_BETA,
+                ramp=self.cfg.LOSS.BWCLDICE_RAMP,
+                w_floor=self.cfg.LOSS.BWCLDICE_W_FLOOR,
+                tol_in=self.cfg.LOSS.BWCLDICE_TOL_IN,
+                tol_out=self.cfg.LOSS.BWCLDICE_TOL_OUT,
+                warmup_iters=self.cfg.LOSS.BWCLDICE_WARMUP,
+                from_logits=True,
+                fg_channel=1 if self.cfg.MODEL.N_CLASSES > 1 else 0,
+            ).to(self.device)
         super().define_metrics()
 
 
